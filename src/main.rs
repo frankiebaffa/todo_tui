@@ -197,8 +197,9 @@ impl Navigator {
             },
             ItemType::Note => {
                 text::Span::styled(
-                    "    ",
+                    "-   ",
                     style::Style::default()
+                        .fg(style::Color::Cyan)
                 )
             },
         };
