@@ -23,6 +23,8 @@ enum Mode {
 }
 #[derive(Parser, Clone)]
 struct Args {
+    #[clap(short, long)]
+    debug: bool,
     #[clap(subcommand)]
     mode: Mode,
 }
@@ -260,6 +262,16 @@ impl Navigator {
         let mut i = 0;
         for item in list_items.into_iter() {
             pos.push(i);
+            // TODO: Fix overrun of sub item tree
+            if self.position.len() > 1 {
+                let mut second_nav_split = self.position.split_off(1);
+                let second_nav_pos = second_nav_split.get(0).unwrap();
+                if second_nav_pos.eq(&i) {
+                    if item.sub_items.len() > 0 {
+                        self.position.append(&mut second_nav_split);
+                    }
+                }
+            }
             self.item_to_list_items(item, &mut items, &mut pos);
             pos.pop().unwrap();
             i = i + 1;
@@ -301,14 +313,20 @@ impl TerminalManager {
                 break;
             }
             self.term.draw(|f| {
+                let constraints = if self.ctx.args.debug {
+                    vec![
+                        layout::Constraint::Length(3),
+                        layout::Constraint::Length(3),
+                    ]
+                } else {
+                    vec![
+                        layout::Constraint::Length(3),
+                    ]
+                };
                 let layout = layout::Layout::default()
-                    .direction(layout::Direction::Vertical)
+                    .direction(layout::Direction::Horizontal)
                     .margin(1)
-                    .constraints(
-                        [
-                            layout::Constraint::Length(3)
-                        ]
-                    )
+                    .constraints(constraints)
                     .split(f.size());
                 let container = Container::load(&mut self.ctx).unwrap_or_else(|e| {
                     panic!("{}", e);
