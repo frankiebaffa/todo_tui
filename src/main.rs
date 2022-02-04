@@ -75,6 +75,11 @@ enum TermEvent {
     Tick,
 }
 #[derive(PartialEq)]
+enum NavMode {
+    Navigate,
+    Input,
+}
+#[derive(PartialEq)]
 enum NavAction {
     MoveOut,
     Next,
@@ -85,7 +90,14 @@ enum NavAction {
     ToggleShowHidden,
     CycleItemStatus,
     ToggleItemHidden,
+    ToggleDebug,
     Initial,
+    PreAddItem,
+    AddItem,
+    PreAddRootItem,
+    AddRootItem,
+    ToggleItemType,
+    RemoveItem,
 }
 impl NavAction {
     fn from_event(event: TermEvent, initial: bool) -> Self {
@@ -95,6 +107,7 @@ impl NavAction {
         match event {
             TermEvent::Key(key) => {
                 match key.code {
+                    KeyCode::Char('D') => Self::ToggleDebug,
                     KeyCode::Char('h') => Self::MoveOut,
                     KeyCode::Char('j') => Self::Next,
                     KeyCode::Char('k') => Self::Prev,
@@ -103,6 +116,10 @@ impl NavAction {
                     KeyCode::Char('H') => Self::ToggleShowHidden,
                     KeyCode::Char('c') => Self::CycleItemStatus,
                     KeyCode::Char('s') => Self::ToggleItemHidden,
+                    KeyCode::Char('t') => Self::ToggleItemType,
+                    KeyCode::Char('a') => Self::PreAddItem,
+                    KeyCode::Char('A') => Self::PreAddRootItem,
+                    KeyCode::Char('R') | KeyCode::Delete => Self::RemoveItem,
                     _ => Self::NoAction,
                 }
             },
@@ -152,18 +169,53 @@ impl LogMsg {
         Self { log_type, message, }
     }
 }
+trait NavigateMap {
+    fn set_nearest_pos(&mut self);
+    fn move_action(&mut self);
+    fn through_items(
+        the_map: &mut Vec<Vec<usize>>, sub_positions: &mut Vec<usize>,
+        items: &Vec<Item>, display_hidden: bool
+    );
+    fn from_items(items: &Vec<Item>, display_hidden: bool) -> Vec<Vec<usize>>;
+}
+struct NavigationMap {
+    position: Vec<usize>,
+    valid_positions: Vec<Vec<usize>>,
+}
 struct Navigator {
+    height: u16,
+    map: NavigationMap,
     d_buffer: Vec<LogMsg>,
     display_hidden: bool,
-    position: Vec<usize>,
+    debug: bool,
     action: NavAction,
+    mode: NavMode,
+    container: Container,
+    i_buffer: String,
 }
 impl Navigator {
-    fn new() -> Self {
+    fn new(ctx: &mut Ctx) -> Self {
+        let display_hidden = false;
+        let container = Container::load(ctx)
+            .unwrap_or_else(|_| panic!("Failed to load list"));
+        let valid_pos = Self::from_items(&container.list.items, display_hidden);
+        let nav_map = NavigationMap { valid_positions: valid_pos, position: vec![0], };
         Self {
-            d_buffer: Vec::new(), display_hidden: false, position: vec![0],
-            action: NavAction::NoAction
+            height: 0,
+            debug: ctx.args.debug, d_buffer: Vec::new(), display_hidden, map: nav_map,
+            action: NavAction::NoAction, container, mode: NavMode::Navigate,
+            i_buffer: String::new()
         }
+    }
+    fn save_and_reload(&mut self, ctx: &mut Ctx) {
+        self.container.save()
+            .unwrap_or_else(|_| panic!("Failed to save list"));
+        let container = Container::load(ctx)
+            .unwrap_or_else(|_| panic!("Failed to load list"));
+        let nav_map = Self::from_items(&container.list.items, self.display_hidden);
+        self.container = container;
+        self.map.valid_positions = nav_map;
+        self.set_nearest_pos();
     }
     fn push_log(&mut self, msg: impl AsRef<str>) {
         self.d_buffer.push(LogMsg::log(msg));
@@ -208,296 +260,453 @@ impl Navigator {
         }
         items
     }
-    fn toggle_show_hidden(&mut self) {
-        self.display_hidden = !self.display_hidden;
-        self.position = vec![0];
-    }
-    fn next_item(&mut self) {
-        let item = self.position.pop().unwrap();
-        self.position.push(item + 1);
-    }
-    fn prev_item(&mut self) {
-        let item = self.position.pop().unwrap();
-        if item == 0 {
-            self.push_warn("Underflow in vertical position corrected (nav)");
-            self.position.push(item);
-            return;
-        }
-        self.position.push(item - 1);
-    }
-    fn inner_item(&mut self) {
-        self.position.push(0);
-    }
-    fn outer_item(&mut self) {
-        if self.position.len() == 1 {
-            self.push_warn("Underflow in horizontal position corrected (nav)");
-            return;
-        }
-        self.position.pop().unwrap();
-    }
     fn get_todo_item_location(&mut self) -> Vec<usize> {
-        let mut action_vec = self.position.clone();
+        let mut action_vec = self.map.position.clone();
         action_vec.reverse();
         action_vec.iter_mut().for_each(|item| {
             *item = *item + 1;
         });
         action_vec
     }
-    fn cycle_status_at(&mut self, container: &mut Container) {
-        let mut action_vec = self.get_todo_item_location();
-        container.act_on_item_at(&mut action_vec, ItemAction::CycleStatus);
-    }
-    fn toggle_item_hidden(&mut self, container: &mut Container) {
-        let mut action_vec = self.get_todo_item_location();
-        container.act_on_item_at(&mut action_vec, ItemAction::ToggleHidden);
-        self.position = vec![0];
-    }
-    fn take_action(&mut self, container: &mut Container) -> bool {
+    fn take_movement_action(&mut self, ctx: &mut Ctx) -> bool {
+        let keep_run;
+        let is_movement;
         match self.action {
+            NavAction::ToggleDebug => {
+                self.push_log("Toggling debug mode");
+                self.debug = !self.debug;
+                keep_run = true;
+                is_movement = false;
+            },
             NavAction::NoAction | NavAction::Initial => {
-                true
+                keep_run = true;
+                is_movement = false;
             },
             NavAction::MoveOut => {
                 self.push_log("Moving out");
-                self.outer_item();
-                true
+                keep_run = true;
+                is_movement = true;
             },
             NavAction::MoveIn => {
                 self.push_log("Moving in");
-                self.inner_item();
-                true
+                keep_run = true;
+                is_movement = true;
             },
             NavAction::Next => {
                 self.push_log("Next item");
-                self.next_item();
-                true
+                keep_run = true;
+                is_movement = true;
             },
             NavAction::Prev => {
                 self.push_log("Prev item");
-                self.prev_item();
-                true
+                keep_run = true;
+                is_movement = true;
             },
             NavAction::Exit => {
-                false
+                keep_run = false;
+                is_movement = false;
             },
             NavAction::ToggleShowHidden => {
                 self.push_log("Hidden toggled");
-                self.toggle_show_hidden();
-                true
+                self.display_hidden = !self.display_hidden;
+                // TODO: Do not save and reload here, just reinit map
+                self.save_and_reload(ctx);
+                keep_run = true;
+                is_movement = true;
             },
             NavAction::CycleItemStatus => {
                 self.push_log("Cycling status");
-                self.cycle_status_at(container);
-                true
+                let mut action_vec = self.get_todo_item_location();
+                self.container.act_on_item_at(&mut action_vec, ItemAction::CycleStatus);
+                self.save_and_reload(ctx);
+                keep_run = true;
+                is_movement = false;
             },
             NavAction::ToggleItemHidden => {
                 self.push_log("Toggling item hidden");
-                self.toggle_item_hidden(container);
-                true
+                let mut action_vec = self.get_todo_item_location();
+                self.container.act_on_item_at(&mut action_vec, ItemAction::ToggleHidden);
+                self.save_and_reload(ctx);
+                keep_run = true;
+                is_movement = false;
             },
+            NavAction::ToggleItemType => {
+                self.push_log("Toggling item type at position");
+                let mut action_vec = self.get_todo_item_location();
+                self.container.act_on_item_at(&mut action_vec, ItemAction::ToggleType);
+                self.save_and_reload(ctx);
+                keep_run = true;
+                is_movement = false;
+            },
+            NavAction::PreAddItem => {
+                self.push_log("Preparing to add item");
+                self.mode = NavMode::Input;
+                keep_run = true;
+                is_movement = false;
+            },
+            NavAction::AddItem => {
+                self.push_log("Adding item");
+                let mut action_vec = self.get_todo_item_location();
+                self.container.act_on_item_at(
+                    &mut action_vec,
+                    ItemAction::Add(ItemType::Todo, self.i_buffer.clone()),
+                );
+                self.i_buffer = String::new();
+                self.save_and_reload(ctx);
+                keep_run = true;
+                is_movement = false;
+            },
+            NavAction::PreAddRootItem => {
+                self.push_log("Preparing to add root item");
+                self.mode = NavMode::Input;
+                keep_run = true;
+                is_movement = false;
+            },
+            NavAction::AddRootItem => {
+                self.push_log("Adding root item");
+                self.container.act_on_item_at(
+                    &mut Vec::new(),
+                    ItemAction::Add(ItemType::Todo, self.i_buffer.clone()),
+                );
+                self.i_buffer = String::new();
+                self.save_and_reload(ctx);
+                keep_run = true;
+                is_movement = false;
+            },
+            NavAction::RemoveItem => {
+                self.push_log("Removing item at position");
+                let mut action_vec = self.get_todo_item_location();
+                self.container.act_on_item_at(
+                    &mut action_vec,
+                    ItemAction::Remove,
+                );
+                self.save_and_reload(ctx);
+                keep_run = true;
+                is_movement = true;
+            },
+        };
+        if is_movement {
+            self.move_action();
+        }
+        keep_run
+    }
+    fn take_action(&mut self, ctx: &mut Ctx) -> bool {
+        match self.mode {
+            NavMode::Navigate => self.take_movement_action(ctx),
+            NavMode::Input => true,
         }
     }
     fn handle_input(&mut self, event: TermEvent, initial: bool) {
-        self.action = NavAction::from_event(event, initial);
+        match self.mode {
+            NavMode::Navigate => {
+                self.action = NavAction::from_event(event, initial);
+            },
+            NavMode::Input => {
+                match event {
+                    TermEvent::Key(key) => match key.code {
+                        KeyCode::Enter => {
+                            // TODO: Finish implementing typing
+                            self.mode = NavMode::Navigate;
+                            match self.action {
+                                NavAction::PreAddRootItem => {
+                                    self.action = NavAction::AddRootItem;
+                                },
+                                NavAction::PreAddItem => {
+                                    self.action = NavAction::AddItem;
+                                },
+                                _ => {},
+                            }
+                        },
+                        KeyCode::Esc => {
+                            self.mode = NavMode::Navigate;
+                            self.action = NavAction::NoAction;
+                        },
+                        KeyCode::Char(c) => {
+                            self.i_buffer.push(c);
+                        },
+                        KeyCode::Backspace => {
+                            self.i_buffer.pop();
+                        },
+                        _ => {},
+                    },
+                    _ => {},
+                }
+            },
+        }
     }
-    fn item_as_widget(&mut self, item: &Item, items: &mut Vec<widgets::ListItem>, pos: &mut Vec<usize>) {
+    fn item_as_widget(&self, item: &Item, items: &mut Vec<widgets::ListItem>, pos: &mut Vec<usize>) {
         let mut indent_str = String::new();
         for _ in 0..pos.len() - 1 {
             indent_str.push_str("    ");
         }
         let indent = text::Span::from(indent_str);
-        let hidden_icon = if self.display_hidden {
-            if item.hidden {
-                "H "
-            } else {
-                "  "
-            }
-        } else {
-            ""
-        };
-        let hidden = text::Span::styled(
-            hidden_icon,
-            style::Style::default().fg(style::Color::Blue)
-        );
         let status = match item.item_type {
             ItemType::Todo => {
                 match item.status {
                     ItemStatus::Complete => {
+                        let color = if item.hidden {
+                            style::Color::DarkGray
+                        } else {
+                            style::Color::Green
+                        };
                         text::Span::styled(
                             "[x] ",
-                            style::Style::default()
-                                .fg(style::Color::Green)
+                            style::Style::default().fg(color)
                         )
                     },
                     ItemStatus::Incomplete => {
+                        let color = if item.hidden {
+                            style::Color::DarkGray
+                        } else {
+                            style::Color::Red
+                        };
                         text::Span::styled(
                             "[ ] ",
-                            style::Style::default()
-                                .fg(style::Color::Red)
+                            style::Style::default().fg(color)
                         )
                     },
                     ItemStatus::Disabled => {
+                        let color = if item.hidden {
+                            style::Color::DarkGray
+                        } else {
+                            style::Color::Yellow
+                        };
                         text::Span::styled(
                             "[-] ",
-                            style::Style::default()
-                                .fg(style::Color::Yellow)
+                            style::Style::default().fg(color)
                         )
                     },
                 }
             },
             ItemType::Note => {
+                let color = if item.hidden {
+                    style::Color::DarkGray
+                } else {
+                    style::Color::Cyan
+                };
                 text::Span::styled(
                     "-   ",
-                    style::Style::default()
-                        .fg(style::Color::Cyan)
+                    style::Style::default().fg(color)
                 )
             },
         };
-        let text = if (*pos).eq(&self.position) {
+        // is item selected?
+        let text = if (*pos).eq(&self.map.position) {
             text::Span::styled(
                 item.text.clone(),
                 style::Style::default().fg(style::Color::Cyan)
             )
         } else {
-            text::Span::from(item.text.clone())
+            if item.hidden {
+                text::Span::styled(
+                    item.text.clone(),
+                    style::Style::default().fg(style::Color::DarkGray)
+                )
+            } else {
+                text::Span::styled(
+                    item.text.clone(),
+                    style::Style::default().fg(style::Color::White)
+                )
+            }
         };
         items.push(widgets::ListItem::new(
-            text::Spans::from(vec![ indent, hidden, status, text, ])
+            text::Spans::from(vec![ indent, status, text, ])
         ));
     }
-    fn fix_position_by_items(&mut self, iter_state: &mut Vec<usize>, items: &Vec<Item>) {
-        // correct vertical position overflow
-        if self.position.len() > iter_state.len() {
-            let cur_pos = self.position.get(iter_state.len()).unwrap();
-            if cur_pos > &(items.len() - 1) {
-                self.position.push(items.len() - 1);
-                self.position[iter_state.len()] = items.len() - 1;
-                self.push_warn("Overflow in vertical position corrected");
-            }
-        }
-        // translate vertical position if not displaying hidden and last action
-        // was vertical movement or last action alters the position vector
-        if !self.display_hidden && (
-            self.action.eq(&NavAction::Initial) ||
-            self.action.eq(&NavAction::Next) ||
-            self.action.eq(&NavAction::Prev) ||
-            self.action.eq(&NavAction::ToggleShowHidden) ||
-            self.action.eq(&NavAction::ToggleItemHidden) ||
-            self.action.eq(&NavAction::MoveIn) ||
-            self.action.eq(&NavAction::MoveOut)
-        ) {
-            let pos_in_list = self.position.get(iter_state.len()).unwrap();
-            // match protects against overflow
-            let message;
-            let index = match items.iter()
-                .filter(|item| !item.hidden)
-                .nth(pos_in_list.clone())
-            {
-                Some(hid_item) => {
-                    message = "Position translated from found item";
-                    items.iter()
-                        .position(|item| item.eq(hid_item))
-                        .unwrap()
-                },
-                None => {
-                    message = "Position translated from corrected vertical overflow";
-                    let mut displayed_items = items.iter()
-                        .filter(|item| !item.hidden)
-                        .collect::<Vec<&Item>>();
-                    let last_displayed = displayed_items.pop().unwrap();
-                    items.iter()
-                        .position(|item| item.eq(last_displayed))
-                        .unwrap()
-                },
-            };
-            if !index.eq(pos_in_list) {
-                self.position[iter_state.len()] = index;
-                self.push_warn(message);
-            }
-        }
-        let mut moment = 0;
-        for item in items.into_iter() {
-            // correct horizontal/vertical position overflow for item
-            if self.position.len() > iter_state.len() {
-                let last_nav_pos = self.position.pop().unwrap();
-                let cur_nav_pos = self.position.pop().unwrap();
-                if cur_nav_pos == moment {
-                    let sub_len = if self.display_hidden {
-                        items.len()
-                    } else {
-                        items.iter()
-                            .filter(|item| !item.hidden)
-                            .collect::<Vec<&Item>>()
-                            .len()
-                    };
-                    if sub_len > 0 && last_nav_pos > sub_len - 1 {
-                        self.position.push(cur_nav_pos);
-                        self.position.push(sub_len - 1);
-                        self.push_warn(
-                            "Overflow in vertical position corrected, > sub-items"
-                        );
-                    } else if sub_len == 0 {
-                        self.position.push(cur_nav_pos);
-                        self.push_warn(
-                            "Overflow in horizontal position corrected, 0 sub-items"
-                        );
-                    } else {
-                        self.position.push(cur_nav_pos);
-                        self.position.push(last_nav_pos);
-                    }
-                } else {
-                    self.position.push(cur_nav_pos);
-                    self.position.push(last_nav_pos);
-                }
-            }
-            self.fix_position_by_items(iter_state, &item.sub_items);
-            moment = moment + 1;
-        }
+    fn get_line_no_from_map(&self) -> usize {
+        let mut y = 0;
+        self.map.position.iter().for_each(|item| {
+            y = y + item + 1;
+        });
+        y
     }
-    fn item_to_list_items(&mut self, item: Item, items: &mut Vec<widgets::ListItem>, pos: &mut Vec<usize>) {
+    fn item_to_list_items(
+        &self, item: &Item, items: &mut Vec<widgets::ListItem>,
+        iter_state: &mut Vec<usize>, mut lines: usize
+    ) {
+        if !self.display_hidden && item.hidden {
+            return;
+        }
+        lines = lines + 1;
+        // TODO: Handle scrolling via height and y_pos
+        //let y_pos = self.get_line_no_from_map();
+        //let rel_pos = self.height
         // add item to list of widgets
-        self.item_as_widget(&item, items, pos);
-        let sub_items = item.sub_items;
+        self.item_as_widget(&item, items, iter_state);
         let mut i = 0;
-        for sub_item in sub_items.into_iter() {
-            pos.push(i);
-            self.item_to_list_items(sub_item, items, pos);
-            pos.pop().unwrap();
+        for sub_item in item.sub_items.iter() {
+            iter_state.push(i);
+            self.item_to_list_items(sub_item, items, iter_state, lines);
+            iter_state.pop().unwrap();
             i = i + 1;
         }
     }
-    fn get_list(&mut self, container: Container) -> Vec<widgets::ListItem> {
+    fn get_list(&self) -> Vec<widgets::ListItem> {
         let mut iter_state = Vec::new();
         let mut items = Vec::new();
-        let mut list_items = container.list.items;
-        if list_items.len() == 0 {
-            list_items.push(
-                Item::new(
-                    ItemType::Note,
-                    "There are no items in this list with current display settings"
-                )
-            );
-        }
-        self.fix_position_by_items(&mut Vec::new(), &list_items);
+        // TODO: Handle empty list
         let mut i = 0;
-        for item in list_items {
+        let lines = 0;
+        for item in self.container.list.items.iter() {
             iter_state.push(i);
-            self.item_to_list_items(item, &mut items, &mut iter_state);
+            self.item_to_list_items(item, &mut items, &mut iter_state, lines);
             iter_state.pop().unwrap();
             i = i + 1;
         }
         items
     }
 }
+impl NavigateMap for Navigator {
+    fn set_nearest_pos(&mut self) {
+        // get nearest valid position
+        // check if same position exists
+        let same_pos = self.map.valid_positions.iter()
+            .filter(|pos| pos == &&self.map.position)
+            .collect::<Vec<&Vec<usize>>>();
+        if same_pos.len() > 0 {
+            let new_pos = *same_pos.first().unwrap();
+            self.map.position = new_pos.clone();
+            return;
+        }
+        // check same/previous levels
+        let mut i = self.map.position.len();
+        while i > 0 {
+            let mut valid_positions_at_level = self.map.valid_positions.iter()
+                .filter(|pos| {
+                    pos.len() == i &&
+                    pos[0..(i - 1)] == self.map.position[0..(i - 1)]
+                })
+                .collect::<Vec<&Vec<usize>>>();
+            if valid_positions_at_level.len() > 0 {
+                let num_to_match = self.map.position.get(i - 1).unwrap().clone() as i32;
+                // sort by closest number to num_to_match to furthest
+                valid_positions_at_level.sort_by(|x, y| {
+                    let x_pos = x.get(i - 1).unwrap().clone() as i32;
+                    let y_pos = y.get(i - 1).unwrap().clone() as i32;
+                    (num_to_match - x_pos).abs()
+                        .cmp(&(num_to_match - y_pos).abs())
+                });
+                self.map.position = (*valid_positions_at_level.first().unwrap())
+                    .clone();
+                break;
+            }
+            let valid_positions_prev_level = self.map.valid_positions.iter()
+                .filter(|pos| {
+                    pos.len() == (i - 1) &&
+                    pos[0..(i - 1)] == self.map.position[0..(i - 1)]
+                })
+                .collect::<Vec<&Vec<usize>>>();
+            if valid_positions_prev_level.len() > 0 {
+                self.map.position = (*valid_positions_prev_level.first().unwrap())
+                    .clone();
+                break;
+            }
+            i = i - 1;
+        }
+        if i == 0 {
+            self.map.position = vec![0];
+        }
+        self.push_warn(
+            "Position could not be maintained, corrected to nearest available position"
+        );
+    }
+    fn move_action(&mut self) {
+        match self.action {
+            NavAction::ToggleItemHidden | NavAction::ToggleShowHidden => {
+                self.set_nearest_pos();
+            },
+            NavAction::MoveIn => {
+                let valid_in_positions = self.map.valid_positions.iter()
+                    .filter(|pos| {
+                        // valid position length equals current position length + 1
+                        pos.len().eq(&(self.map.position.len() + 1)) &&
+                            // valid position without last value equals current position
+                            pos[0..self.map.position.len()].eq(&self.map.position)
+                    })
+                    .collect::<Vec<&Vec<usize>>>();
+                if valid_in_positions.len() > 0 {
+                    let new_pos = *valid_in_positions.get(0).unwrap();
+                    self.map.position = new_pos.clone();
+                } else {
+                    self.push_warn("Horizontal positional overflow avoided");
+                }
+            },
+            NavAction::MoveOut => {
+                if self.map.position.len() > 1 {
+                    self.map.position.pop().unwrap();
+                } else {
+                    self.push_warn("Horizontal positional underflow avoided");
+                }
+            },
+            NavAction::Next => {
+                let valid_next_positions = self.map.valid_positions.iter()
+                    .filter(|pos| {
+                        pos.len() == self.map.position.len() &&
+                            pos[0..pos.len() - 1] == self.map.position[0..self.map.position.len() - 1] &&
+                            pos.get(pos.len() - 1).unwrap() > self.map.position.get(self.map.position.len() - 1).unwrap()
+                    })
+                    .collect::<Vec<&Vec<usize>>>();
+                if valid_next_positions.len() > 0 {
+                    let new_pos = *valid_next_positions.get(0).unwrap();
+                    self.map.position = new_pos.clone();
+                } else {
+                    self.push_warn("Vertical position overflow avoided");
+                }
+            },
+            NavAction::Prev => {
+                if self.map.position.get(self.map.position.len() - 1).unwrap().eq(&0) {
+                    self.push_warn("Vertical position underflow avoided");
+                    return;
+                }
+                let valid_prev_positions = self.map.valid_positions.iter()
+                    .filter(|pos| {
+                        pos.len() == self.map.position.len() &&
+                            pos[0..pos.len() - 1] == self.map.position[0..self.map.position.len() - 1] &&
+                            pos.get(pos.len() - 1).unwrap() < self.map.position.get(self.map.position.len() - 1).unwrap()
+                    })
+                    .collect::<Vec<&Vec<usize>>>();
+                if valid_prev_positions.len() > 0 {
+                    let new_pos = *valid_prev_positions
+                        .get(valid_prev_positions.len() - 1)
+                        .unwrap();
+                    self.map.position = new_pos.clone();
+                } else {
+                    self.push_warn("Vertical position underflow avoided");
+                }
+            },
+            _ => {},
+        }
+    }
+    fn through_items(
+        the_map: &mut Vec<Vec<usize>>, sub_positions: &mut Vec<usize>, items: &Vec<Item>, display_hidden: bool
+    ) {
+        let mut moment = 0;
+        for item in items.into_iter() {
+            sub_positions.push(moment);
+            // perform checks
+            if display_hidden || !item.hidden {
+                the_map.push(sub_positions.clone());
+                Self::through_items(the_map, sub_positions, &item.sub_items, display_hidden);
+            }
+            sub_positions.pop();
+            moment = moment + 1;
+        }
+    }
+    fn from_items(items: &Vec<Item>, display_hidden: bool) -> Vec<Vec<usize>> {
+        let mut the_map = Vec::new();
+        let mut sub_positions = Vec::new();
+        Self::through_items(&mut the_map, &mut sub_positions, items, display_hidden);
+        the_map
+    }
+}
 struct TerminalManager {
-    ctx: Ctx,
     term: Terminal<CrosstermBackend<Stdout>>,
     event_rx: Receiver<TermEvent>,
     navigator: Navigator,
 }
 impl TerminalManager {
     fn init(
-        ctx: Ctx, mut out: Stdout, event_rx: Receiver<TermEvent>,
+        ctx: &mut Ctx, mut out: Stdout, event_rx: Receiver<TermEvent>,
     ) -> Result<Self, IOError> {
         execute!(
             &mut out,
@@ -506,55 +715,49 @@ impl TerminalManager {
         execute!(
             &mut out,
             terminal::EnterAlternateScreen,
-            event::EnableMouseCapture,
         )?;
         terminal::enable_raw_mode()?;
         let term = tui::Terminal::new(CrosstermBackend::new(out))?;
         Ok(Self {
-            ctx, term,
-            event_rx,
-            navigator: Navigator::new(),
+            term, event_rx,
+            navigator: Navigator::new(ctx),
         })
     }
-    fn run(&mut self) {
+    fn run(&mut self, ctx: &mut Ctx) {
         let mut initial = true;
         loop {
             self.navigator.handle_input(self.event_rx.recv().unwrap(), initial);
             if initial {
                 initial = false;
             }
-            let mut container = Container::load(&mut self.ctx).unwrap_or_else(|e| {
-                panic!("{}", e);
-            });
-            if !self.navigator.take_action(&mut container) {
+            if !self.navigator.take_action(ctx) {
                 break;
             }
-            // save/reload container if need be
-            match self.navigator.action {
-                NavAction::CycleItemStatus | NavAction::ToggleItemHidden => {
-                    container.save().unwrap_or_else(|_| {
-                        self.navigator.push_error("Failed to save list");
-                    });
-                    match Container::load(&mut self.ctx) {
-                        Ok(c) => {
-                            container = c;
-                        },
-                        Err(_) => {
-                            self.navigator.push_error("Failed to load list");
-                        },
-                    };
-                },
-                _ => {},
-            }
+            let is_input_mode = if self.navigator.mode.eq(&NavMode::Input) {
+                true
+            } else {
+                false
+            };
             self.term.draw(|rect| {
-                let constraints = if self.ctx.args.debug {
+                let constraints = if self.navigator.debug && is_input_mode {
                     [
-                        layout::Constraint::Ratio(3, 5),
-                        layout::Constraint::Ratio(2, 5)
+                        layout::Constraint::Min(3),
+                        layout::Constraint::Length(3),
+                        layout::Constraint::Length(6),
+                    ].as_ref()
+                } else if is_input_mode {
+                    [
+                        layout::Constraint::Min(3),
+                        layout::Constraint::Length(3),
+                    ].as_ref()
+                } else if self.navigator.debug {
+                    [
+                        layout::Constraint::Min(3),
+                        layout::Constraint::Length(6),
                     ].as_ref()
                 } else {
                     [
-                        layout::Constraint::Length(3),
+                        layout::Constraint::Min(3),
                     ].as_ref()
                 };
                 let layout = layout::Layout::default()
@@ -562,14 +765,36 @@ impl TerminalManager {
                     .margin(1)
                     .constraints(constraints)
                     .split(rect.size());
-                let list_items = self.navigator.get_list(container);
+                let list_items = self.navigator.get_list();
                 let list = widgets::List::new(list_items).block(
                     widgets::Block::default()
                         .borders(widgets::Borders::all())
-                        .title(self.ctx.get_path().to_str().unwrap())
+                        .title(ctx.get_path().to_str().unwrap())
                         .title_alignment(layout::Alignment::Left)
                 );
-                if self.ctx.args.debug {
+                let text_box = widgets::Paragraph::new(
+                    self.navigator.i_buffer.clone()
+                ).block(
+                    widgets::Block::default()
+                        .borders(widgets::Borders::all())
+                        .title("Text")
+                        .title_alignment(layout::Alignment::Left)
+                );
+                if self.navigator.debug && is_input_mode  {
+                    rect.render_widget(list, layout[0]);
+                    rect.render_widget(text_box, layout[1]);
+                    let buf_items = self.navigator.render_buffer();
+                    let buf_list = widgets::List::new(buf_items).block(
+                        widgets::Block::default()
+                        .borders(widgets::Borders::all())
+                        .title("Debug")
+                        .title_alignment(layout::Alignment::Left)
+                    );
+                    rect.render_widget(buf_list, layout[2]);
+                } else if is_input_mode {
+                    rect.render_widget(list, layout[0]);
+                    rect.render_widget(text_box, layout[1]);
+                } else if self.navigator.debug {
                     rect.render_widget(list, layout[0]);
                     let buf_items = self.navigator.render_buffer();
                     let buf_list = widgets::List::new(buf_items).block(
@@ -581,6 +806,11 @@ impl TerminalManager {
                     rect.render_widget(buf_list, layout[1]);
                 } else {
                     rect.render_widget(list, layout[0]);
+                }
+                if !layout[0].height.eq(&self.navigator.height) {
+                    let y = layout[0].height.clone();
+                    self.navigator.height = y;
+                    self.navigator.push_log(format!("Height set to {}", y));
                 }
             }).unwrap();
         }
@@ -631,8 +861,8 @@ fn main() -> Result<(), IOError> {
             }
         }
     });
-    let mut tman = TerminalManager::init(ctx, get_stdout(), rx)?;
-    tman.run();
+    let mut tman = TerminalManager::init(&mut ctx, get_stdout(), rx)?;
+    tman.run(&mut ctx);
     tman.exit()?;
     Ok(())
 }
