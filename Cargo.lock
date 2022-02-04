@@ -448,7 +448,7 @@ dependencies = [
 [[package]]
 name = "todo-core"
 version = "1.0.0"
-source = "git+https://github.com/frankiebaffa/todo_core?branch=master#d369f2d724f1f10ded59b77ee8363941edf703bb"
+source = "git+https://github.com/frankiebaffa/todo_core?branch=master#5b56d6935e0e437d5abf20db74d266a679e2eb25"
 dependencies = [
  "chrono",
  "crossterm",
