@@ -28,6 +28,8 @@ enum Mode {
 struct Args {
     #[clap(short, long)]
     debug: bool,
+    #[clap(short='s', long)]
+    display_hidden: bool,
     #[clap(subcommand)]
     mode: Mode,
 }
@@ -91,19 +93,19 @@ enum NavAction {
     CycleItemStatus,
     ToggleItemHidden,
     ToggleDebug,
-    Initial,
     PreAddItem,
     AddItem,
     PreAddRootItem,
     AddRootItem,
     ToggleItemType,
     RemoveItem,
+    GoToBottom,
+    GoToTop,
+    GoToRootLevel,
+    //GoToInnerLevel,
 }
 impl NavAction {
-    fn from_event(event: TermEvent, initial: bool) -> Self {
-        if initial {
-            return Self::Initial;
-        }
+    fn from_event(event: TermEvent) -> Self {
         match event {
             TermEvent::Key(key) => {
                 match key.code {
@@ -120,6 +122,10 @@ impl NavAction {
                     KeyCode::Char('a') => Self::PreAddItem,
                     KeyCode::Char('A') => Self::PreAddRootItem,
                     KeyCode::Char('R') | KeyCode::Delete => Self::RemoveItem,
+                    KeyCode::Char('g') => Self::GoToTop,
+                    KeyCode::Char('G') => Self::GoToBottom,
+                    //KeyCode::Char('$') => Self::GoToInnerLevel,
+                    KeyCode::Char('0') => Self::GoToRootLevel,
                     _ => Self::NoAction,
                 }
             },
@@ -178,9 +184,72 @@ trait NavigateMap {
     );
     fn from_items(items: &Vec<Item>, display_hidden: bool) -> Vec<Vec<usize>>;
 }
+struct WindowBufferBounds {
+    size: u16,
+    min: u16,
+    max: u16,
+    pos: u16,
+}
+impl WindowBufferBounds {
+    // The drawn borders for the Y-bounds take up 1 line apiece
+    const Y_PADDING: u16 = 2;
+    fn init() -> Self {
+        Self {
+            size: 0,
+            min: 0,
+            max: 0,
+            pos: 0,
+        }
+    }
+    fn set_size(&mut self, size: u16, pos: &Vec<usize>, valid_pos: &Vec<Vec<usize>>, initial: bool) -> bool {
+        let mut changed = false;
+        let new_size = size - Self::Y_PADDING;
+        if self.size != new_size {
+            self.size = new_size;
+            changed = true;
+        }
+        if self.size > 0 && self.max == 0 {
+            self.min = 0;
+            self.max = self.size - 1;
+            changed = true;
+        }
+        if initial {
+            self.pos = 0;
+            changed = true;
+        } else {
+            // calculate absolute position
+            let mut absolute_pos = 0;
+            for position in valid_pos.iter() {
+                if position == pos {
+                    break;
+                }
+                absolute_pos = absolute_pos + 1;
+            }
+            if self.pos != absolute_pos {
+                self.pos = absolute_pos as u16;
+                changed = true;
+            }
+        }
+        // set min/max
+        if self.pos >= self.max {
+            self.max = self.pos;
+            self.min = self.max - (self.size - 1);
+            changed = true;
+        } else if self.pos < self.min {
+            self.min = self.pos;
+            self.max = self.min + (self.size - 1);
+            changed = true;
+        }
+        changed
+    }
+    fn is_in_view(&self, line: u16) -> bool {
+        line > self.min && line <= (self.max + 1)
+    }
+}
 struct NavigationMap {
     position: Vec<usize>,
     valid_positions: Vec<Vec<usize>>,
+    window_buffer: WindowBufferBounds,
 }
 struct Navigator {
     height: u16,
@@ -195,11 +264,15 @@ struct Navigator {
 }
 impl Navigator {
     fn new(ctx: &mut Ctx) -> Self {
-        let display_hidden = false;
+        let display_hidden = ctx.args.display_hidden;
         let container = Container::load(ctx)
             .unwrap_or_else(|_| panic!("Failed to load list"));
         let valid_pos = Self::from_items(&container.list.items, display_hidden);
-        let nav_map = NavigationMap { valid_positions: valid_pos, position: vec![0], };
+        let nav_map = NavigationMap {
+            valid_positions: valid_pos,
+            position: vec![0],
+            window_buffer: WindowBufferBounds::init(),
+        };
         Self {
             height: 0,
             debug: ctx.args.debug, d_buffer: Vec::new(), display_hidden, map: nav_map,
@@ -268,6 +341,20 @@ impl Navigator {
         });
         action_vec
     }
+    fn handle_win_buf(&mut self, initial: bool) {
+        let changed = self.map.window_buffer.set_size(
+            self.height, &self.map.position, &self.map.valid_positions, initial
+        );
+        if changed {
+            self.push_log(format!(
+                "WinBuf set to height: {}, min: {}, max: {}, pos: {}",
+                self.map.window_buffer.size,
+                self.map.window_buffer.min,
+                self.map.window_buffer.max,
+                self.map.window_buffer.pos,
+            ));
+        }
+    }
     fn take_movement_action(&mut self, ctx: &mut Ctx) -> bool {
         let keep_run;
         let is_movement;
@@ -278,7 +365,7 @@ impl Navigator {
                 keep_run = true;
                 is_movement = false;
             },
-            NavAction::NoAction | NavAction::Initial => {
+            NavAction::NoAction => {
                 keep_run = true;
                 is_movement = false;
             },
@@ -384,9 +471,30 @@ impl Navigator {
                 keep_run = true;
                 is_movement = true;
             },
+            NavAction::GoToTop => {
+                self.push_log("Top");
+                keep_run = true;
+                is_movement = true;
+            },
+            NavAction::GoToBottom => {
+                self.push_log("Bottom");
+                keep_run = true;
+                is_movement = true;
+            },
+            NavAction::GoToRootLevel => {
+                self.push_log("Root");
+                keep_run = true;
+                is_movement = true;
+            },
+            //NavAction::GoToInnerLevel => {
+            //    self.push_log("Innermost");
+            //    keep_run = true;
+            //    is_movement = true;
+            //},
         };
         if is_movement {
             self.move_action();
+            self.handle_win_buf(false);
         }
         keep_run
     }
@@ -396,10 +504,10 @@ impl Navigator {
             NavMode::Input => true,
         }
     }
-    fn handle_input(&mut self, event: TermEvent, initial: bool) {
+    fn handle_input(&mut self, event: TermEvent) {
         match self.mode {
             NavMode::Navigate => {
-                self.action = NavAction::from_event(event, initial);
+                self.action = NavAction::from_event(event);
             },
             NavMode::Input => {
                 match event {
@@ -513,26 +621,18 @@ impl Navigator {
             text::Spans::from(vec![ indent, status, text, ])
         ));
     }
-    fn get_line_no_from_map(&self) -> usize {
-        let mut y = 0;
-        self.map.position.iter().for_each(|item| {
-            y = y + item + 1;
-        });
-        y
-    }
     fn item_to_list_items(
         &self, item: &Item, items: &mut Vec<widgets::ListItem>,
-        iter_state: &mut Vec<usize>, mut lines: usize
+        iter_state: &mut Vec<usize>, lines: &mut u16
     ) {
         if !self.display_hidden && item.hidden {
             return;
         }
-        lines = lines + 1;
+        *lines = (*lines) + 1;
         // TODO: Handle scrolling via height and y_pos
-        //let y_pos = self.get_line_no_from_map();
-        //let rel_pos = self.height
-        // add item to list of widgets
-        self.item_as_widget(&item, items, iter_state);
+        if self.map.window_buffer.is_in_view(*lines) {
+            self.item_as_widget(&item, items, iter_state);
+        }
         let mut i = 0;
         for sub_item in item.sub_items.iter() {
             iter_state.push(i);
@@ -546,10 +646,10 @@ impl Navigator {
         let mut items = Vec::new();
         // TODO: Handle empty list
         let mut i = 0;
-        let lines = 0;
+        let mut lines = 0;
         for item in self.container.list.items.iter() {
             iter_state.push(i);
-            self.item_to_list_items(item, &mut items, &mut iter_state, lines);
+            self.item_to_list_items(item, &mut items, &mut iter_state, &mut lines);
             iter_state.pop().unwrap();
             i = i + 1;
         }
@@ -674,6 +774,24 @@ impl NavigateMap for Navigator {
                     self.push_warn("Vertical position underflow avoided");
                 }
             },
+            NavAction::GoToTop => {
+                let next_position = self.map.valid_positions.iter().filter(|pos| {
+                    pos[0..pos.len() - 1] == self.map.position[0..self.map.position.len() - 1]
+                }).next().unwrap();
+                self.map.position = next_position.clone();
+            },
+            NavAction::GoToBottom => {
+                let next_position = self.map.valid_positions.iter().filter(|pos| {
+                    pos[0..pos.len() - 1] == self.map.position[0..self.map.position.len() - 1]
+                }).last().unwrap();
+                self.map.position = next_position.clone();
+            },
+            NavAction::GoToRootLevel => {
+                let next_position = self.map.valid_positions.iter().filter(|pos| {
+                    pos[0] == self.map.position[0]
+                }).next().unwrap();
+                self.map.position = next_position.clone();
+            },
             _ => {},
         }
     }
@@ -725,20 +843,27 @@ impl TerminalManager {
     }
     fn run(&mut self, ctx: &mut Ctx) {
         let mut initial = true;
+        let mut is_running = true;
         loop {
-            self.navigator.handle_input(self.event_rx.recv().unwrap(), initial);
-            if initial {
-                initial = false;
-            }
-            if !self.navigator.take_action(ctx) {
-                break;
-            }
-            let is_input_mode = if self.navigator.mode.eq(&NavMode::Input) {
-                true
-            } else {
-                false
-            };
             self.term.draw(|rect| {
+                self.navigator.handle_input(self.event_rx.recv().unwrap());
+                // initialize possible movements / locations
+                if initial {
+                    self.navigator.set_nearest_pos();
+                }
+                if !self.navigator.take_action(ctx) {
+                    is_running = false;
+                    return;
+                }
+                let is_input_mode = if self.navigator.mode.eq(&NavMode::Input) {
+                    if initial {
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                };
                 let constraints = if self.navigator.debug && is_input_mode {
                     [
                         layout::Constraint::Min(3),
@@ -765,6 +890,12 @@ impl TerminalManager {
                     .margin(1)
                     .constraints(constraints)
                     .split(rect.size());
+                if !layout[0].height.eq(&(self.navigator.height)) {
+                    let y = layout[0].height.clone();
+                    self.navigator.height = y;
+                    self.navigator.push_log(format!("Height set to {}", self.navigator.height));
+                    self.navigator.handle_win_buf(initial);
+                }
                 let list_items = self.navigator.get_list();
                 let list = widgets::List::new(list_items).block(
                     widgets::Block::default()
@@ -807,12 +938,11 @@ impl TerminalManager {
                 } else {
                     rect.render_widget(list, layout[0]);
                 }
-                if !layout[0].height.eq(&self.navigator.height) {
-                    let y = layout[0].height.clone();
-                    self.navigator.height = y;
-                    self.navigator.push_log(format!("Height set to {}", y));
-                }
             }).unwrap();
+            initial = false;
+            if !is_running {
+                break;
+            }
         }
     }
     fn exit(&mut self) -> Result<(), IOError> {
@@ -829,7 +959,8 @@ impl TerminalManager {
     }
 }
 fn main() -> Result<(), IOError> {
-    let tick_rate = Duration::from_millis(200);
+    const TICK: u64 = 200;
+    let tick_rate = Duration::from_millis(TICK);
     let mut ctx;
     { // construct ctx
         let args = Args::parse();
@@ -838,7 +969,8 @@ fn main() -> Result<(), IOError> {
     ctx.construct_path();
     match ctx.args.mode.clone() {
         Mode::New(_) => {
-            Container::create(&mut ctx).unwrap_or_else(|e| panic!("{}", e));
+            let mut c = Container::create(&mut ctx).unwrap_or_else(|e| panic!("{}", e));
+            c.save().unwrap_or_else(|e| panic!("{}", e));
         },
         Mode::Open(_) => {},
     }
