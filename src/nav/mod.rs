@@ -116,7 +116,7 @@ impl Navigator {
     pub fn new(ctx: &mut Ctx) -> Self {
         let display_hidden = ctx.args.display_hidden;
         let container = Container::load(ctx)
-            .unwrap_or_else(|_| panic!("Failed to load list"));
+            .unwrap_or_else(|e| panic!("Failed to load list: {}", e));
         let hash = Self::get_file_hash(ctx);
         let valid_pos = Self::from_items(&container.list.items, display_hidden);
         let nav_map = NavigationMap {
