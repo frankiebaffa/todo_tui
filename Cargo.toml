@@ -8,5 +8,6 @@ edition = "2021"
 [dependencies]
 clap = { version = "3", features = ["derive"] }
 crossterm = "0.22"
+md-5 = "0.10"
 todo-core = { git = "https://github.com/frankiebaffa/todo_core", branch = "master" }
 tui = "0.17"
