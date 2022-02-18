@@ -106,7 +106,7 @@ impl TerminalManager {
                         .title_alignment(layout::Alignment::Left)
                 );
                 let text_box = widgets::Paragraph::new(
-                    self.navigator.i_buffer.clone()
+                    format!("{}|", self.navigator.i_buffer.clone())
                 ).block(
                     widgets::Block::default()
                         .borders(widgets::Borders::all())
